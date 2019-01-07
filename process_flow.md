@@ -1,3 +1,5 @@
+# Process Flow Document #
+
 1. The first part of the process is to store the files on cloud. For the POC
     we used AWS S3 to store test patient files in folders prefixed by DF_. Next
     we retrieve the files using Python's boto3 library.
