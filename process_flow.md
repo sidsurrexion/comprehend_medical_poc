@@ -187,3 +187,51 @@
         components['MEDICAL_CONDITION'] = medical_condition_list
         return components
     ```
+
+6. Lastly the information is stored in each of the patient folders that is also
+    used to filter which patients have been processed.
+
+    ```
+    s3.put_object(settings.bucket_name, join(settings.prefix, *[patient,
+                                                                settings.discovery_folder,
+                                                                settings.discovery_file]), data)
+    ```
+
+
+7. An individual patient file takes around 4-5 seconds for OCR extraction and 3-4
+    seconds for NLP through AWS Comprehend Medical. To speed up the process each
+    patient's file is run through multiple processors as the volume in each DF_
+    could be very large.
+
+    ```
+    partial_process_patient_files = partial(process_patient_files, mapper)
+    with Pool() as pool:
+        pool.map(partial_process_patient_files, patient_files[patient])
+    ```
+
+8. The entire process is orchestrated through Docker and a nightly batch job is
+    scheduled through AWS CloudWatch that triggers AWS batch running the Docker
+    container inside AWS EC2.
+
+    ```
+    job_queue_name = command_line_args.repo_name + '_job_queue'
+    job_definition_name = command_line_args.repo_name + '_job_definition'
+    aws_lambda_function_name = command_line_args.repo_name +\
+        "_aws_lambda_function"
+    deploy_settings = get_deploy_settings()
+    docker_image = deploy_settings["DOCKER_IMAGE"]
+    aws_account_id = boto3.client('sts').get_caller_identity().get('Account')
+    schedule_expression = "cron(15 11 ? * * *)"
+
+    create_update_aws_batch_resources(
+        aws_account_id, compute_env_name, job_queue_name, job_definition_name,
+        docker_image, command_line_args.shell_script_to_run_app)
+
+    create_update_aws_lambda_function(
+        aws_account_id, aws_lambda_function_name, command_line_args.repo_name)
+
+    create_update_aws_cloudwatch_trigger(
+        aws_lambda_function_name, deploy_settings, schedule_expression)
+
+    print("Deployed Successfully")
+    ```
