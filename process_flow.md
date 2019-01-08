@@ -15,7 +15,7 @@
 
 
 2. Once the patient files are retrieved from AWS S3 each file is then processed
-    for Object Character Recognition (OCR). We use Google's Cloud Vision API to
+    for Optical Character Recognition (OCR). We use Google's Cloud Vision API to
     perform OCR but it requires the input files to be in 'JPEG' format. So an
     initial file formatting is required to get the corresponding OCR text for the
     file.
@@ -45,6 +45,7 @@
             mapper[file] = metadata.prepare_metadata_catalog(comprehend_medical_result)
     ```
 
+
 3. Once the initial file formatting is performed Google Cloud Vision API is used
     for text extraction.
 
@@ -58,4 +59,131 @@
         })
         converted_text = response.text_annotations[0].description
         return converted_text
+    ```
+
+
+4. With the extracted OCR texts, AWS Comprehend Medical API is then called to
+    interpret medical information pertaining to Protected Health Information (PHI),
+    medical condition, test procedure names, anatomy and medication.
+
+    ```
+    comprehend_medical_result = s3.detect_entities(ocr_text)
+    mapper[file] = metadata.prepare_metadata_catalog(comprehend_medical_result)
+    ```
+
+
+5. Even though AWS comprehend categorizes the medical information it still needs
+    editing with respect to associating PHI based upon content offsets and removing
+    redundant medical conditions. For similar anatomical information, position
+    of the anatomy is combined together.
+
+    ```
+    # Offset Management
+
+    def prepare_metadata_catalog(result):
+        components = get_overall_components()
+        previous_category = ''
+        previous_offset = get_offset(result[0])
+        ongoing_category_component = {}
+        for categorical_data in result:
+            current_category = categorical_data['Category']
+
+            if (previous_category and previous_category != current_category) or (
+                    previous_category and previous_category == current_category and
+                    categorical_data['BeginOffset'] - previous_offset['EndOffset'] > 20):
+                components[previous_category].append(ongoing_category_component)
+
+            if current_category == 'PROTECTED_HEALTH_INFORMATION':
+                if current_category != previous_category:
+                    ongoing_category_component = get_personal_health_information()
+                else:
+                    if categorical_data['BeginOffset'] - previous_offset['EndOffset'] > 20:
+                        ongoing_category_component = get_personal_health_information()
+                ongoing_category_component[categorical_data['Type']].append(categorical_data['Text'])
+
+            elif current_category == 'MEDICATION':
+                if current_category != previous_category:
+                    ongoing_category_component = get_medication_information()
+                else:
+                    if categorical_data['BeginOffset'] - previous_offset['EndOffset'] > 20:
+                        ongoing_category_component = get_medication_information()
+                ongoing_category_component[categorical_data['Type']] = categorical_data['Text']
+                if 'Attributes' in categorical_data and categorical_data['Attributes']:
+                    ongoing_category_component['Attributes'] = categorical_data['Attributes']
+                if 'Traits' in categorical_data and categorical_data['Traits']:
+                    ongoing_category_component['Traits'] = categorical_data['Traits']
+
+            elif current_category == 'MEDICAL_CONDITION':
+                if current_category != previous_category:
+                    ongoing_category_component = get_medical_condition_information()
+                else:
+                    if categorical_data['BeginOffset'] - previous_offset['EndOffset'] > 20:
+                        ongoing_category_component = get_medical_condition_information()
+                if categorical_data['Type'] == 'DX_NAME':
+                    ongoing_category_component[categorical_data['Type']] = categorical_data['Text']
+                else:
+                    ongoing_category_component[categorical_data['Type']].append(categorical_data['Text'])
+
+                if 'Traits' in categorical_data and categorical_data['Traits']:
+                    ongoing_category_component['Traits'] = categorical_data['Traits']
+
+            elif current_category == 'TEST_TREATMENT_PROCEDURE':
+                if current_category != previous_category:
+                    ongoing_category_component = get_test_treatment_procedure_information()
+                else:
+                    if categorical_data['BeginOffset'] - previous_offset['EndOffset'] > 20:
+                        ongoing_category_component = get_test_treatment_procedure_information()
+                ongoing_category_component[categorical_data['Type']] = categorical_data['Text']
+                if 'Attributes' in categorical_data and categorical_data['Attributes']:
+                    ongoing_category_component['Attributes'] = categorical_data['Attributes']
+
+            else:
+                if current_category != previous_category:
+                    ongoing_category_component = get_anatomy_information()
+                else:
+                    if categorical_data['BeginOffset'] - previous_offset['EndOffset'] > 20:
+                        ongoing_category_component = get_anatomy_information()
+                if categorical_data['Type'] == 'SYSTEM_ORGAN_SITE':
+                    ongoing_category_component[categorical_data['Type']] = categorical_data['Text']
+                else:
+                    ongoing_category_component[categorical_data['Type']].append(categorical_data['Text'])
+            previous_category = current_category
+            previous_offset = get_offset(categorical_data)
+        components[previous_category].append(ongoing_category_component)
+        components = filter_personal_health_information(components)
+        components = filter_anatomical_data(components)
+        components = filter_medical_conditions(components)
+        components = filter_initial_test_procedures(components)
+        return filter_personal_health_information(components)
+    ```
+
+    ```
+    def filter_anatomical_data(components):
+        organ_site_to_direction_map = {}
+        anatomies = []
+        for anatomy in components['ANATOMY']:
+            if anatomy['SYSTEM_ORGAN_SITE'].lower() not in organ_site_to_direction_map:
+                organ_site_to_direction_map[anatomy['SYSTEM_ORGAN_SITE'].lower()] = anatomy['DIRECTION']
+            else:
+                organ_site_to_direction_map[anatomy['SYSTEM_ORGAN_SITE'].lower()].extend(anatomy['DIRECTION'])
+        for key, value in organ_site_to_direction_map.items():
+            anatomy = get_anatomy_information()
+            anatomy['SYSTEM_ORGAN_SITE'] = key
+            anatomy['DIRECTION'] = list(set(value))
+            anatomies.append(anatomy)
+        components['ANATOMY'] = anatomies
+        return components
+
+
+    def filter_medical_conditions(components):
+        medical_condition_list = []
+        unique_dx_names = set()
+        for medical_condition in components['MEDICAL_CONDITION']:
+            if medical_condition['Traits'] and medical_condition['DX_NAME'].lower() not in unique_dx_names:
+                for trait in medical_condition['Traits']:
+                    if trait['Name'] == 'DIAGNOSIS' and trait['Score'] > 0.9:
+                        medical_condition_list.append(medical_condition)
+                        unique_dx_names.add(medical_condition['DX_NAME'].lower())
+        components['MEDICAL_CONDITION'] = medical_condition_list
+        return components
     ```
